@@ -26,7 +26,6 @@ import static com.moilioncircle.redis.replicator.Status.CONNECTING;
 import static com.moilioncircle.redis.replicator.Status.DISCONNECTED;
 import static com.moilioncircle.redis.replicator.Status.DISCONNECTING;
 import static com.moilioncircle.redis.replicator.cmd.CommandParsers.toInt;
-import static com.moilioncircle.redis.replicator.util.Concurrents.terminateQuietly;
 import static com.moilioncircle.redis.replicator.util.Strings.format;
 import static com.moilioncircle.redis.replicator.util.Strings.isEquals;
 import static com.moilioncircle.redis.replicator.util.Tuples.of;
@@ -36,8 +35,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.Socket;
 import java.util.Objects;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 
 import org.slf4j.Logger;
@@ -59,6 +56,7 @@ import com.moilioncircle.redis.replicator.io.RedisOutputStream;
 import com.moilioncircle.redis.replicator.net.RedisSocketFactory;
 import com.moilioncircle.redis.replicator.rdb.RdbParser;
 import com.moilioncircle.redis.replicator.util.Strings;
+import com.moilioncircle.redis.replicator.util.XScheduledExecutorService;
 
 /**
  * @author Leon Chen
@@ -75,7 +73,7 @@ public class RedisSocketReplicator extends AbstractReplicator {
     protected ReplyParser replyParser;
     protected ScheduledFuture<?> heartbeat;
     protected RedisOutputStream outputStream;
-    protected ScheduledExecutorService executor;
+    protected XScheduledExecutorService executor;
     protected final RedisSocketFactory socketFactory;
     
     public RedisSocketReplicator(String host, int port, Configuration configuration) {
@@ -86,7 +84,6 @@ public class RedisSocketReplicator extends AbstractReplicator {
         this.port = port;
         this.configuration = configuration;
         this.socketFactory = new RedisSocketFactory(configuration);
-        this.executor = configuration.getExecutor();
         builtInCommandParserRegister();
         if (configuration.isUseDefaultExceptionListener())
             addExceptionListener(new DefaultExceptionListener());
@@ -109,18 +106,13 @@ public class RedisSocketReplicator extends AbstractReplicator {
     @Override
     public void open() throws IOException {
         super.open();
-        boolean usingCustomExecutor = this.executor != null;
-        if (!usingCustomExecutor) {
-            this.executor = Executors.newSingleThreadScheduledExecutor();
-        }
+        this.executor = new XScheduledExecutorService(configuration);
         try {
             new RedisSocketReplicatorRetrier().retry(this);
         } finally {
             doClose();
             doCloseListener(this);
-            if (!usingCustomExecutor) {
-                terminateQuietly(executor, configuration.getConnectionTimeout(), MILLISECONDS);
-            }
+            this.executor.terminateQuietly(configuration.getConnectionTimeout(), MILLISECONDS);
         }
     }
     
@@ -191,20 +183,29 @@ public class RedisSocketReplicator extends AbstractReplicator {
         if (password != null) {
             // sha256 mask password
             String mask = "#" + Strings.mask(password);
-            logger.info("AUTH {} {}", user, mask);
-            if (user != null) {
-                send("AUTH".getBytes(), user.getBytes(), password.getBytes());
-            } else {
+            if (user == null) {
+                logger.info("AUTH {}", mask);
                 send("AUTH".getBytes(), password.getBytes());
+            } else {
+                logger.info("AUTH {} {}", user, mask);
+                send("AUTH".getBytes(), user.getBytes(), password.getBytes());
             }
             final String reply = Strings.toString(reply());
             logger.info(reply);
             if ("OK".equals(reply)) return;
             if (reply.contains("no password")) {
-                logger.warn("[AUTH {} {}] failed. {}", user, mask, reply);
+                if (user == null) {
+                    logger.warn("[AUTH {}] failed. {}", mask, reply);
+                } else {
+                    logger.warn("[AUTH {} {}] failed. {}", user, mask, reply);
+                }
                 return;
             }
-            throw new AssertionError("[AUTH " + user + " " + mask + "] failed. " + reply);
+            if (user == null) {
+                throw new AssertionError("[AUTH " + mask + "] failed. " + reply);
+            } else {
+                throw new AssertionError("[AUTH " + user + " " + mask + "] failed. " + reply);
+            }
         }
     }
     
